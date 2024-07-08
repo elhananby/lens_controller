@@ -90,13 +90,13 @@ impl LensController {
         row.z >= self.tracking_zone.z_min && row.z <= self.tracking_zone.z_max
     }
 
-    fn handle_event(&mut self, event: BraidEvent) {
+    fn handle_event(&mut self, event: BraidEvent, received_time: Instant) {
         match event {
             BraidEvent::Birth(row) | BraidEvent::Update(row) => {
                 if self.is_in_zone(&row) {
                     if self.currently_tracked_obj.is_none() || self.currently_tracked_obj == Some(row.obj_id) {
                         self.currently_tracked_obj = Some(row.obj_id);
-                        self.update_lens_position(row.z);
+                        self.update_lens_position(row.z, received_time);
                         info!("Tracking object {}: z = {}", row.obj_id, row.z);
                     }
                 } else if self.currently_tracked_obj == Some(row.obj_id) {
@@ -113,16 +113,22 @@ impl LensController {
         }
     }
 
-    fn update_lens_position(&mut self, z: f64) {
+    fn update_lens_position(&mut self, z: f64, received_time: Instant) {
         let now = Instant::now();
         if now.duration_since(self.last_update_time) >= self.update_interval {
+            let processing_time = now.duration_since(received_time);
             debug!("Updating lens position for z = {}", z);
             // self.lens_driver.update_position(z);
+            let update_time = Instant::now().duration_since(now);
             self.last_update_time = now;
+            
+            info!("Performance: Processing time: {:?}, Update time: {:?}, Total time: {:?}",
+                  processing_time, update_time, processing_time + update_time);
         } else {
             debug!("Skipping lens update due to time constraint");
         }
     }
+
 
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let events_url = self.braid_url.join("events")?;
@@ -132,15 +138,15 @@ impl LensController {
             .send()?;
 
         let mut reader = BufReader::new(response);
-        let mut buffer = String::new();
+        let mut buffer = String::with_capacity(1024);
 
         loop {
             buffer.clear();
+            let received_time = Instant::now();
             match reader.read_line(&mut buffer) {
                 Ok(0) => break,  // End of stream
                 Ok(_) => {
-                    if let Some(stripped) = buffer.strip_prefix("data: "){
-
+                    if let Some(stripped) = buffer.strip_prefix("data: ") {
                         let data: Value = serde_json::from_str(stripped)?;
                         
                         if let Some(msg) = data["msg"].as_object() {
@@ -153,7 +159,7 @@ impl LensController {
                                 };
 
                                 if let Some(event) = event {
-                                    self.handle_event(event);
+                                    self.handle_event(event, received_time);
                                 } else {
                                     warn!("Received unknown event type: {}", event_type);
                                 }
@@ -180,9 +186,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(20); // Default to 100ms if not provided
     
     let tracking_zone = TrackingZone {
-        x_min: -10.0, x_max: 10.0,
-        y_min: -10.0, y_max: 10.0,
-        z_min: 0.0, z_max: 100.0,
+        x_min: -0.05, x_max: 0.05,
+        y_min: -0.05, y_max: 0.05,
+        z_min: 0.1, z_max: 0.25,
     };
 
     info!("Initializing LensController with URL: {}, port: {}, update interval: {}ms", 
