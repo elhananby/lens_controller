@@ -12,7 +12,7 @@ use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::Value;
 use std::fs::File;
-use tokio;
+
 use url::Url;
 
 struct LinearModel {
@@ -208,7 +208,7 @@ impl LensController {
         if now.duration_since(self.last_update_time) >= self.update_interval {
             let processing_time = now.duration_since(received_time);
             debug!("Updating lens position for z = {}", z);
-            let dpt = self.model.predict(z as f64);
+            let dpt = self.model.predict(z);
             let _ = self.lens_driver.focalpower(Some(dpt));
             let update_time = Instant::now().duration_since(now);
             self.last_update_time = now;
