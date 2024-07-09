@@ -168,15 +168,12 @@ impl LensController {
             BraidEvent::Birth(row) | BraidEvent::Update(row) => {
                 // Check if object is in the tracking zone
                 if self.is_in_zone(&row) {
-
                     // Check if it's a new object
                     if self.currently_tracked_obj.is_none() {
-
                         // new + in zone
                         info!("Object {} entered the tracking zone", row.obj_id);
                         self.object_birth_time = Instant::now();
                         self.currently_tracked_obj = Some(row.obj_id);
-
                     } else if self.currently_tracked_obj == Some(row.obj_id) {
                         // existing + in zone
                         debug!("Tracking object {}: z = {}", row.obj_id, row.z);
@@ -184,15 +181,22 @@ impl LensController {
 
                     // update lens either way
                     self.update_lens_position(row.z, received_time);
-
                 } else if self.currently_tracked_obj == Some(row.obj_id) {
-                    info!("Object {} left the tracking zone after {} seconds", row.obj_id, self.object_birth_time.elapsed().as_secs());
+                    info!(
+                        "Object {} left the tracking zone after {} seconds",
+                        row.obj_id,
+                        self.object_birth_time.elapsed().as_secs()
+                    );
                     self.currently_tracked_obj = None;
                 }
             }
             BraidEvent::Death { obj_id } => {
                 if self.currently_tracked_obj == Some(obj_id) {
-                    info!("Tracked object {} died after {} seconds", obj_id, self.object_birth_time.elapsed().as_secs());
+                    info!(
+                        "Tracked object {} died after {} seconds",
+                        obj_id,
+                        self.object_birth_time.elapsed().as_secs()
+                    );
                     self.currently_tracked_obj = None;
                 }
             }
