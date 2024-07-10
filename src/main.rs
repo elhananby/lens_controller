@@ -303,10 +303,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let update_interval_ms = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20); // Default to 20ms if not provided
 
     let tracking_zone = TrackingZone {
-        x_min: -0.20,
-        x_max: 0.20,
-        y_min: -0.20,
-        y_max: 0.20,
+        x_min: -0.10,
+        x_max: 0.10,
+        y_min: -0.10,
+        y_max: 0.10,
         z_min: 0.1,
         z_max: 0.25,
     };
