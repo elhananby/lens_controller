@@ -15,6 +15,25 @@ use std::fs::File;
 
 use url::Url;
 
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[clap(name = "LensController")]
+#[clap(about = "Controls the liquid lens system", long_about = None)]
+struct Args {
+    #[clap(long, default_value = "http://10.40.80.6:8397/")]
+    braid_url: String,
+
+    #[clap(long, default_value = "/dev/optotune_ld")]
+    lens_driver_port: String,
+
+    #[clap(long, default_value_t = 20)]
+    update_interval_ms: u64,
+
+    #[clap(long, default_value = "test")]
+    save_folder: String,
+}
+
 struct LinearModel {
     slope: f64,
     intercept: f64,
@@ -50,6 +69,7 @@ struct LensController {
     braid_url: Url,
     client: Client,
     lens_driver: LensDriver,
+    save_folder: String,
     tracking_zone: TrackingZone,
     model: LinearModel,
     currently_tracked_obj: Option<u32>,
@@ -74,6 +94,7 @@ impl LensController {
         lens_driver_port: &str,
         tracking_zone: TrackingZone,
         update_interval_ms: u64,
+        save_folder: &str,
     ) -> Result<Self, Box<dyn Error>> {
         let url = Url::parse(braid_url)?;
         let client = Client::new();
@@ -95,6 +116,7 @@ impl LensController {
             braid_url: url,
             client,
             lens_driver,
+            save_folder: save_folder.to_string(),
             tracking_zone,
             model,
             currently_tracked_obj: None,
@@ -291,16 +313,17 @@ impl LensController {
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    let args: Vec<String> = env::args().collect();
-    let braid_url = args
-        .get(1)
-        .map(String::as_str)
-        .unwrap_or("http://10.40.80.6:8397/");
-    let lens_driver_port = args
-        .get(2)
-        .map(String::as_str)
-        .unwrap_or("/dev/optotune_ld");
-    let update_interval_ms = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20); // Default to 20ms if not provided
+    let args = Args::parse();
+    // let args: Vec<String> = env::args().collect();
+    // let braid_url = args
+    //     .get(1)
+    //     .map(String::as_str)
+    //     .unwrap_or("http://10.40.80.6:8397/");
+    // let lens_driver_port = args
+    //     .get(2)
+    //     .map(String::as_str)
+    //     .unwrap_or("/dev/optotune_ld");
+    // let update_interval_ms = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20); // Default to 20ms if not provided
 
     let tracking_zone = TrackingZone {
         x_min: -0.10,
@@ -311,15 +334,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         z_max: 0.25,
     };
 
+    let braid_url = &args.braid_url;
+    let lens_driver_port = &args.lens_driver_port;
+    let update_interval_ms = args.update_interval_ms;
+    let save_folder = &args.save_folder;
+
     info!(
-        "Initializing LensController with URL: {}, port: {}, update interval: {}ms",
-        braid_url, lens_driver_port, update_interval_ms
+        "Initializing LensController with URL: {}, port: {}, update interval: {}ms, save_folder: {}",
+        braid_url, lens_driver_port, update_interval_ms, save_folder
     );
     let mut lens_controller = LensController::new(
         braid_url,
         lens_driver_port,
         tracking_zone,
         update_interval_ms,
+        save_folder,
     )
     .await?;
 
