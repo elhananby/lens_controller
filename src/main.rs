@@ -1,4 +1,4 @@
-use std::env;
+
 use std::error::Error;
 use std::time::{Duration, Instant};
 
