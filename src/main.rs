@@ -313,14 +313,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
-    
     let tracking_zone = TrackingZone {
-        x_min: -0.075,
-        x_max: 0.075,
+        x_min: -0.1,
+        x_max: 0.1,
         y_min: -0.1,
-        y_max: 0.10,
-        z_min: 0.1,
-        z_max: 0.3,
+        y_max: 0.1,
+        z_min: 0.15,
+        z_max: 0.25,
     };
 
     let braid_url = &args.braid_url;
