@@ -313,23 +313,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
-    // let args: Vec<String> = env::args().collect();
-    // let braid_url = args
-    //     .get(1)
-    //     .map(String::as_str)
-    //     .unwrap_or("http://10.40.80.6:8397/");
-    // let lens_driver_port = args
-    //     .get(2)
-    //     .map(String::as_str)
-    //     .unwrap_or("/dev/optotune_ld");
-    // let update_interval_ms = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20); // Default to 20ms if not provided
-
     let tracking_zone = TrackingZone {
-        x_min: -0.10,
-        x_max: 0.10,
-        y_min: -0.10,
-        y_max: 0.10,
-        z_min: 0.1,
+        x_min: -0.1,
+        x_max: 0.1,
+        y_min: -0.1,
+        y_max: 0.1,
+        z_min: 0.15,
         z_max: 0.25,
     };
 
