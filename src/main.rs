@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use env_logger::Env;
-use eventsource_stream::EventStream;
+use eventsource_stream::{EventStream, Event};  // Added Event here
 use futures_util::StreamExt;
 use lens_driver::LensDriver;
 use linregress::{FormulaRegressionBuilder, RegressionDataBuilder};
@@ -187,20 +187,14 @@ impl LensController {
     fn handle_event(&mut self, event: BraidEvent, received_time: Instant) {
         match event {
             BraidEvent::Birth(row) | BraidEvent::Update(row) => {
-                // Check if object is in the tracking zone
                 if self.is_in_zone(&row) {
-                    // Check if it's a new object
                     if self.currently_tracked_obj.is_none() {
-                        // new + in zone
                         info!("Object {} entered the tracking zone", row.obj_id);
                         self.object_birth_time = Instant::now();
                         self.currently_tracked_obj = Some(row.obj_id);
                     } else if self.currently_tracked_obj == Some(row.obj_id) {
-                        // existing + in zone
                         debug!("Tracking object {}: z = {}", row.obj_id, row.z);
                     }
-
-                    // update lens either way
                     self.update_lens_position(row.z, received_time);
                 } else if self.currently_tracked_obj == Some(row.obj_id) {
                     info!(
@@ -247,8 +241,7 @@ impl LensController {
 
     async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let events_url = self.braid_url.join("events")?;
-        let response = self
-            .client
+        let response = self.client
             .get(events_url)
             .header("Accept", "text/event-stream")
             .send()
@@ -259,52 +252,47 @@ impl LensController {
 
         while let Some(event_result) = stream.next().await {
             match event_result {
-                Ok(event) => {
-                    if event.event == "braid" {
-                        let received_time = Instant::now();
-                        let data = &event.data;
-                        match serde_json::from_str::<Value>(data) {
-                            Ok(json_data) => {
-                                if let Some(msg) = json_data["msg"].as_object() {
-                                    if let Some((event_type, event_data)) = msg.iter().next() {
-                                        let braid_event_result = match event_type.as_str() {
-                                            "Birth" => Self::parse_kalman_estimates(event_data)
-                                                .map(BraidEvent::Birth),
-                                            "Update" => Self::parse_kalman_estimates(event_data)
-                                                .map(BraidEvent::Update),
-                                            "Death" => Some(BraidEvent::Death {
-                                                obj_id: event_data.as_u64().unwrap() as u32,
-                                            }),
-                                            _ => None,
-                                        };
-
-                                        if let Some(braid_event) = braid_event_result {
-                                            self.handle_event(braid_event, received_time);
-                                        } else {
-                                            warn!("Received unknown event type: {}", event_type);
-                                        }
-                                    } else {
-                                        warn!("Received empty message object");
-                                    }
-                                } else {
-                                    warn!("Missing 'msg' field in data: {:?}", json_data);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error parsing JSON: {:?}", e);
-                                error!("Raw data: {}", data);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error in event stream: {:?}", e);
-                    // Optionally, implement retry logic here
-                }
+                Ok(event) => self.handle_event_stream(event).await,
+                Err(e) => error!("Error in event stream: {:?}", e),
             }
         }
 
         Ok(())
+    }
+
+    async fn handle_event_stream(&mut self, event: Event) {
+        if event.event != "braid" {
+            return;
+        }
+
+        let received_time = Instant::now();
+        match self.parse_braid_event(&event.data) {
+            Ok(Some(braid_event)) => self.handle_event(braid_event, received_time),
+            Ok(None) => {}, // Unknown event type, already logged in parse_braid_event
+            Err(e) => error!("Error processing event: {:?}", e),
+        }
+    }
+
+    fn parse_braid_event(&self, data: &str) -> Result<Option<BraidEvent>, Box<dyn Error>> {
+        let json_data: Value = serde_json::from_str(data)?;
+        
+        let msg = json_data["msg"].as_object()
+            .ok_or("Missing 'msg' field in data")?;
+
+        let (event_type, event_data) = msg.iter().next()
+            .ok_or("Received empty message object")?;
+
+        Ok(match event_type.as_str() {
+            "Birth" => Self::parse_kalman_estimates(event_data).map(BraidEvent::Birth),
+            "Update" => Self::parse_kalman_estimates(event_data).map(BraidEvent::Update),
+            "Death" => Some(BraidEvent::Death {
+                obj_id: event_data.as_u64().ok_or("Invalid obj_id")? as u32,
+            }),
+            _ => {
+                warn!("Received unknown event type: {}", event_type);
+                None
+            },
+        })
     }
 }
 
