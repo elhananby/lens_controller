@@ -107,7 +107,7 @@ impl LensController {
         client.get(url.clone()).send().await?;
 
         // setup the linear model for the lens
-        let file_path = "/home/buchsbaum/lens_calibration/liquid_lens_calibration.csv";
+        let file_path = "/home/buchsbaum/liquid_lens_calibration_20240815.csv";
         let model = Self::create_linear_model_from_csv(file_path)?;
 
         // Return the initialized LensController
@@ -136,8 +136,8 @@ impl LensController {
         // Read and add data points
         for result in rdr.records() {
             let record = result?;
-            let distance: f64 = record.get(1).ok_or("Missing distance")?.parse()?;
-            let dpt: f64 = record.get(0).ok_or("Missing dpt")?.parse()?;
+            let distance: f64 = record.get(0).ok_or("Missing distance")?.parse()?;
+            let dpt: f64 = record.get(1).ok_or("Missing dpt")?.parse()?;
             xs.push(distance);
             ys.push(dpt);
         }
@@ -153,7 +153,7 @@ impl LensController {
         // Extract slope and intercept
         let slope = model.parameters()[1]; // The slope is the second parameter
         let intercept = model.parameters()[0]; // The intercept is the first parameter
-        info!("Linear model: y = {}x + {}", slope, intercept);
+        debug!("Linear model: y = {}x + {}", slope, intercept);
 
         Ok(LinearModel { slope, intercept })
     }
@@ -189,7 +189,7 @@ impl LensController {
             BraidEvent::Birth(row) | BraidEvent::Update(row) => {
                 if self.is_in_zone(&row) {
                     if self.currently_tracked_obj.is_none() {
-                        info!("Object {} entered the tracking zone", row.obj_id);
+                        debug!("Object {} entered the tracking zone", row.obj_id);
                         self.object_birth_time = Instant::now();
                         self.currently_tracked_obj = Some(row.obj_id);
                     } else if self.currently_tracked_obj == Some(row.obj_id) {
@@ -197,7 +197,7 @@ impl LensController {
                     }
                     self.update_lens_position(row.z, received_time);
                 } else if self.currently_tracked_obj == Some(row.obj_id) {
-                    info!(
+                    debug!(
                         "Object {} left the tracking zone after {} seconds",
                         row.obj_id,
                         self.object_birth_time.elapsed().as_secs()
@@ -207,7 +207,7 @@ impl LensController {
             }
             BraidEvent::Death { obj_id } => {
                 if self.currently_tracked_obj == Some(obj_id) {
-                    info!(
+                    debug!(
                         "Tracked object {} died after {} seconds",
                         obj_id,
                         self.object_birth_time.elapsed().as_secs()
@@ -306,8 +306,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         x_max: 0.1,
         y_min: -0.1,
         y_max: 0.1,
-        z_min: 0.15,
-        z_max: 0.25,
+        z_min: 0.10,
+        z_max: 0.30,
     };
 
     let braid_url = &args.braid_url;
