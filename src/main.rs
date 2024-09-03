@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use env_logger::Env;
-use eventsource_stream::{EventStream, Event};  // Added Event here
+use eventsource_stream::{EventStream, Event};
 use futures_util::StreamExt;
 use lens_driver::LensDriver;
 use linregress::{FormulaRegressionBuilder, RegressionDataBuilder};
@@ -26,11 +26,23 @@ struct Args {
     #[clap(long, default_value = "/dev/optotune_ld")]
     lens_driver_port: String,
 
-    #[clap(long, default_value_t = 20)]
-    update_interval_ms: u64,
-
     #[clap(long, default_value = "test")]
     save_folder: String,
+
+    #[clap(long, default_value = "0.5")]
+    smoothing_factor: f64,
+
+    #[clap(long, default_value = "100")]
+    prediction_time_delta_ms: u64,
+
+    #[clap(long, default_value = "10")]
+    min_update_interval_ms: u64,
+
+    #[clap(long, default_value = "100")]
+    max_update_interval_ms: u64,
+
+    #[clap(long, default_value = "0.5")]
+    velocity_scaling_factor: f64,
 }
 
 struct LinearModel {
@@ -73,8 +85,13 @@ struct LensController {
     model: LinearModel,
     currently_tracked_obj: Option<u32>,
     last_update_time: Instant,
-    update_interval: Duration,
     object_birth_time: Instant,
+    current_focal_power: f64,
+    smoothing_factor: f64,
+    prediction_time_delta: Duration,
+    min_update_interval: Duration,
+    max_update_interval: Duration,
+    velocity_scaling_factor: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -92,8 +109,12 @@ impl LensController {
         braid_url: &str,
         lens_driver_port: &str,
         tracking_zone: TrackingZone,
-        update_interval_ms: u64,
         save_folder: &str,
+        smoothing_factor: f64,
+        prediction_time_delta: Duration,
+        min_update_interval_ms: u64,
+        max_update_interval_ms: u64,
+        velocity_scaling_factor: f64,
     ) -> Result<Self, Box<dyn Error>> {
         let url = Url::parse(braid_url)?;
         let client = Client::new();
@@ -120,8 +141,13 @@ impl LensController {
             model,
             currently_tracked_obj: None,
             last_update_time: Instant::now(),
-            update_interval: Duration::from_millis(update_interval_ms),
             object_birth_time: Instant::now(),
+            current_focal_power: 0.0,
+            smoothing_factor,
+            prediction_time_delta,
+            min_update_interval: Duration::from_millis(min_update_interval_ms),
+            max_update_interval: Duration::from_millis(max_update_interval_ms),
+            velocity_scaling_factor,
         })
     }
 
@@ -184,33 +210,56 @@ impl LensController {
             && row.z <= self.tracking_zone.z_max
     }
 
+    fn predict_future_position(&self, row: &KalmanEstimatesRow) -> (f64, f64, f64) {
+        let time_delta = self.prediction_time_delta.as_secs_f64();
+        (
+            row.x + row.xvel * time_delta,
+            row.y + row.yvel * time_delta,
+            row.z + row.zvel * time_delta
+        )
+    }
+
+    fn smooth_lens_adjustment(&mut self, target_dpt: f64) -> Result<f64, Box<dyn Error>> {
+        self.current_focal_power = self.current_focal_power * (1.0 - self.smoothing_factor) + target_dpt * self.smoothing_factor;
+        self.lens_driver.focalpower(Some(self.current_focal_power))
+    }
+
+    fn calculate_dynamic_update_interval(&self, row: &KalmanEstimatesRow) -> Duration {
+        let velocity = (row.xvel.powi(2) + row.yvel.powi(2) + row.zvel.powi(2)).sqrt();
+        let interval = self.max_update_interval.as_secs_f64() / (1.0 + self.velocity_scaling_factor * velocity);
+        let interval = interval.max(self.min_update_interval.as_secs_f64());
+        Duration::from_secs_f64(interval)
+    }
+
     fn handle_event(&mut self, event: BraidEvent, received_time: Instant) {
         match event {
             BraidEvent::Birth(row) | BraidEvent::Update(row) => {
                 if self.is_in_zone(&row) {
-                    if self.currently_tracked_obj.is_none() {
+                    if self.currently_tracked_obj != Some(row.obj_id) {
                         debug!("Object {} entered the tracking zone", row.obj_id);
-                        self.object_birth_time = Instant::now();
+                        self.object_birth_time = received_time;
                         self.currently_tracked_obj = Some(row.obj_id);
-                    } else if self.currently_tracked_obj == Some(row.obj_id) {
+                    } else {
                         debug!("Tracking object {}: z = {}", row.obj_id, row.z);
                     }
-                    self.update_lens_position(row.z, received_time);
+                    self.update_lens_position(&row, received_time);
                 } else if self.currently_tracked_obj == Some(row.obj_id) {
+                    let tracking_duration = received_time.duration_since(self.object_birth_time);
                     debug!(
-                        "Object {} left the tracking zone after {} seconds",
+                        "Object {} left the tracking zone after {:.2} seconds",
                         row.obj_id,
-                        self.object_birth_time.elapsed().as_secs()
+                        tracking_duration.as_secs_f64()
                     );
                     self.currently_tracked_obj = None;
                 }
             }
             BraidEvent::Death { obj_id } => {
                 if self.currently_tracked_obj == Some(obj_id) {
+                    let tracking_duration = received_time.duration_since(self.object_birth_time);
                     debug!(
-                        "Tracked object {} died after {} seconds",
+                        "Tracked object {} died after {:.2} seconds",
                         obj_id,
-                        self.object_birth_time.elapsed().as_secs()
+                        tracking_duration.as_secs_f64()
                     );
                     self.currently_tracked_obj = None;
                 }
@@ -218,21 +267,33 @@ impl LensController {
         }
     }
 
-    fn update_lens_position(&mut self, z: f64, received_time: Instant) {
+    fn update_lens_position(&mut self, row: &KalmanEstimatesRow, received_time: Instant) {
         let now = Instant::now();
-        if now.duration_since(self.last_update_time) >= self.update_interval {
+        let dynamic_update_interval = self.calculate_dynamic_update_interval(row);
+        if now.duration_since(self.last_update_time) >= dynamic_update_interval {
             let processing_time = now.duration_since(received_time);
-            debug!("Updating lens position for z = {}", z);
-            let dpt = self.model.predict(z);
-            let _ = self.lens_driver.focalpower(Some(dpt));
+            
+            // Predict future position
+            let (_, _, predicted_z) = self.predict_future_position(row);
+            debug!("Updating lens position for predicted z = {}", predicted_z);
+            
+            // Calculate target diopters using the predicted position
+            let target_dpt = self.model.predict(predicted_z);
+            
+            // Apply smooth lens adjustment
+            if let Err(e) = self.smooth_lens_adjustment(target_dpt) {
+                error!("Error adjusting lens: {:?}", e);
+            }
+            
             let update_time = Instant::now().duration_since(now);
             self.last_update_time = now;
 
             debug!(
-                "Performance: Processing time: {:?}, Update time: {:?}, Total time: {:?}",
+                "Performance: Processing time: {:?}, Update time: {:?}, Total time: {:?}, Dynamic interval: {:?}",
                 processing_time,
                 update_time,
-                processing_time + update_time
+                processing_time + update_time,
+                dynamic_update_interval
             );
         } else {
             debug!("Skipping lens update due to time constraint");
@@ -312,19 +373,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let braid_url = &args.braid_url;
     let lens_driver_port = &args.lens_driver_port;
-    let update_interval_ms = args.update_interval_ms;
     let save_folder = &args.save_folder;
 
     info!(
-        "Initializing LensController with URL: {}, port: {}, update interval: {}ms, save_folder: {}",
-        braid_url, lens_driver_port, update_interval_ms, save_folder
+        "Initializing LensController with URL: {}, port: {}, update interval: {}ms-{}ms, save_folder: {}, smoothing_factor: {}, prediction_time_delta: {}ms, velocity_scaling_factor: {}",
+        braid_url, lens_driver_port, args.min_update_interval_ms, args.max_update_interval_ms, save_folder, args.smoothing_factor, args.prediction_time_delta_ms, args.velocity_scaling_factor
     );
     let mut lens_controller = LensController::new(
         braid_url,
         lens_driver_port,
         tracking_zone,
-        update_interval_ms,
         save_folder,
+        args.smoothing_factor,
+        Duration::from_millis(args.prediction_time_delta_ms),
+        args.min_update_interval_ms,
+        args.max_update_interval_ms,
+        args.velocity_scaling_factor,
     )
     .await?;
 
