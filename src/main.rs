@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use env_logger::Env;
-use eventsource_stream::{EventStream, Event};
+use eventsource_stream::{Event, EventStream};
 use futures_util::StreamExt;
 use lens_driver::LensDriver;
 use linregress::{FormulaRegressionBuilder, RegressionDataBuilder};
@@ -19,8 +19,9 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[clap(name = "LensController")]
 #[clap(about = "Controls the liquid lens system", long_about = None)]
+
 struct Args {
-    #[clap(long, default_value = "http://10.40.80.6:8397/")]
+    #[clap(long, default_value = "http://127.0.0.1:8397/")]
     braid_url: String,
 
     #[clap(long, default_value = "/dev/optotune_ld")]
@@ -120,17 +121,21 @@ impl LensController {
         let client = Client::new();
 
         // Setup lens driver
+        log::debug!("Connecting to lens driver on port {}", lens_driver_port);
         let mut lens_driver = LensDriver::new(Some(lens_driver_port.to_string()));
         lens_driver.connect()?;
         lens_driver.mode(Some("focal"))?;
 
         // Verify connection
+        log::debug!("Verifying connection...");
         client.get(url.clone()).send().await?;
 
         // setup the linear model for the lens
-        let file_path = "/home/buchsbaum/liquid_lens_calibration_20240815.csv";
+        log::debug!("Setting up linear model...");
+        let file_path = "/home/buchsbaum/liquid_lens_calibration_20240930.csv";
         let model = Self::create_linear_model_from_csv(file_path)?;
 
+        log::debug!("Initializing LensController...");
         // Return the initialized LensController
         Ok(Self {
             braid_url: url,
@@ -168,20 +173,56 @@ impl LensController {
             ys.push(dpt);
         }
 
-        // Build the regression model
-        let data = vec![("Y", ys), ("X1", xs)];
-        let regression_data = RegressionDataBuilder::new().build_from(data)?;
-        let model = FormulaRegressionBuilder::new()
-            .data(&regression_data)
-            .formula("Y ~ X1")
-            .fit()?;
+        // Check if we have enough observations for regression
+        if xs.len() >= 3 {
+            // Build the regression model
+            let data = vec![("Y", ys.clone()), ("X1", xs.clone())];
+            let regression_data = RegressionDataBuilder::new().build_from(data)?;
+            let model = FormulaRegressionBuilder::new()
+                .data(&regression_data)
+                .formula("Y ~ X1")
+                .fit();
 
-        // Extract slope and intercept
-        let slope = model.parameters()[1]; // The slope is the second parameter
-        let intercept = model.parameters()[0]; // The intercept is the first parameter
-        debug!("Linear model: y = {}x + {}", slope, intercept);
+            match model {
+                Ok(fitted_model) => {
+                    let slope = fitted_model.parameters()[1];
+                    let intercept = fitted_model.parameters()[0];
+                    debug!("Linear model (regression): y = {}x + {}", slope, intercept);
+                    Ok(LinearModel { slope, intercept })
+                }
+                Err(_) => Self::fallback_linear_model(&xs, &ys),
+            }
+        } else {
+            Self::fallback_linear_model(&xs, &ys)
+        }
+    }
 
-        Ok(LinearModel { slope, intercept })
+    fn fallback_linear_model(xs: &[f64], ys: &[f64]) -> Result<LinearModel, Box<dyn Error>> {
+        if xs.len() != ys.len() || xs.is_empty() {
+            return Err("Invalid data for fallback method".into());
+        }
+
+        if xs.len() == 1 {
+            // If we have only one point, assume a horizontal line
+            warn!("Only one data point available. Assuming horizontal line.");
+            Ok(LinearModel {
+                slope: 0.0,
+                intercept: ys[0],
+            })
+        } else {
+            // Use the first and last points to calculate slope and intercept
+            let x1 = xs[0];
+            let y1 = ys[0];
+            let x2 = xs[xs.len() - 1];
+            let y2 = ys[ys.len() - 1];
+
+            let slope = (y2 - y1) / (x2 - x1);
+            let intercept = y1 - slope * x1;
+
+            warn!("Using fallback method with {} data points.", xs.len());
+            debug!("Linear model (fallback): y = {}x + {}", slope, intercept);
+            Ok(LinearModel { slope, intercept })
+        }
     }
 
     fn parse_kalman_estimates(data: &Value) -> Option<KalmanEstimatesRow> {
@@ -215,18 +256,20 @@ impl LensController {
         (
             row.x + row.xvel * time_delta,
             row.y + row.yvel * time_delta,
-            row.z + row.zvel * time_delta
+            row.z + row.zvel * time_delta,
         )
     }
 
     fn smooth_lens_adjustment(&mut self, target_dpt: f64) -> Result<f64, Box<dyn Error>> {
-        self.current_focal_power = self.current_focal_power * (1.0 - self.smoothing_factor) + target_dpt * self.smoothing_factor;
+        self.current_focal_power = self.current_focal_power * (1.0 - self.smoothing_factor)
+            + target_dpt * self.smoothing_factor;
         self.lens_driver.focalpower(Some(self.current_focal_power))
     }
 
     fn calculate_dynamic_update_interval(&self, row: &KalmanEstimatesRow) -> Duration {
         let velocity = (row.xvel.powi(2) + row.yvel.powi(2) + row.zvel.powi(2)).sqrt();
-        let interval = self.max_update_interval.as_secs_f64() / (1.0 + self.velocity_scaling_factor * velocity);
+        let interval = self.max_update_interval.as_secs_f64()
+            / (1.0 + self.velocity_scaling_factor * velocity);
         let interval = interval.max(self.min_update_interval.as_secs_f64());
         Duration::from_secs_f64(interval)
     }
@@ -272,19 +315,19 @@ impl LensController {
         let dynamic_update_interval = self.calculate_dynamic_update_interval(row);
         if now.duration_since(self.last_update_time) >= dynamic_update_interval {
             let processing_time = now.duration_since(received_time);
-            
+
             // Predict future position
             let (_, _, predicted_z) = self.predict_future_position(row);
             debug!("Updating lens position for predicted z = {}", predicted_z);
-            
+
             // Calculate target diopters using the predicted position
             let target_dpt = self.model.predict(predicted_z);
-            
+
             // Apply smooth lens adjustment
             if let Err(e) = self.smooth_lens_adjustment(target_dpt) {
                 error!("Error adjusting lens: {:?}", e);
             }
-            
+
             let update_time = Instant::now().duration_since(now);
             self.last_update_time = now;
 
@@ -302,7 +345,8 @@ impl LensController {
 
     async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let events_url = self.braid_url.join("events")?;
-        let response = self.client
+        let response = self
+            .client
             .get(events_url)
             .header("Accept", "text/event-stream")
             .send()
@@ -329,19 +373,19 @@ impl LensController {
         let received_time = Instant::now();
         match self.parse_braid_event(&event.data) {
             Ok(Some(braid_event)) => self.handle_event(braid_event, received_time),
-            Ok(None) => {}, // Unknown event type, already logged in parse_braid_event
+            Ok(None) => {} // Unknown event type, already logged in parse_braid_event
             Err(e) => error!("Error processing event: {:?}", e),
         }
     }
 
     fn parse_braid_event(&self, data: &str) -> Result<Option<BraidEvent>, Box<dyn Error>> {
         let json_data: Value = serde_json::from_str(data)?;
-        
-        let msg = json_data["msg"].as_object()
+
+        let msg = json_data["msg"]
+            .as_object()
             .ok_or("Missing 'msg' field in data")?;
 
-        let (event_type, event_data) = msg.iter().next()
-            .ok_or("Received empty message object")?;
+        let (event_type, event_data) = msg.iter().next().ok_or("Received empty message object")?;
 
         Ok(match event_type.as_str() {
             "Birth" => Self::parse_kalman_estimates(event_data).map(BraidEvent::Birth),
@@ -352,14 +396,14 @@ impl LensController {
             _ => {
                 warn!("Received unknown event type: {}", event_type);
                 None
-            },
+            }
         })
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
 
     let args = Args::parse();
     let tracking_zone = TrackingZone {
